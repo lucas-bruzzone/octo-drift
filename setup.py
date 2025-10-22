@@ -1,4 +1,3 @@
-
 # setup.py
 from setuptools import setup, find_packages
 
@@ -12,7 +11,7 @@ setup(
     description="Novelty detection in data streams with concept drift adaptation",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/octo-drift",
+    url="https://github.com/lucas-bruzzone/octo-drift",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
