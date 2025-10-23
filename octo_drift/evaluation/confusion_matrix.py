@@ -30,11 +30,15 @@ class ConfusionMatrix:
     Attributes:
         matrix: Nested dict {true_label: {predicted_label: count}}
         last_merge: Track most recent merges
+        prev_unknown_count: Track unknown count from previous evaluation
     """
 
     def __init__(self):
         self.matrix: Dict[float, Dict[float, int]] = {}
         self.last_merge: Dict[float, float] = {}
+        self.prev_unknown_count: int = (
+            0  # NOVO: rastrear unknowns do intervalo anterior
+        )
 
     def add_instance(self, true_label: float, predicted_label: float) -> None:
         """
@@ -143,62 +147,92 @@ class ConfusionMatrix:
         return result
 
     def calculate_metrics(
-        self, timestamp: int, unknown_count: float, divisor: float
+        self, timestamp: int, total_unknown: float, divisor: float
     ) -> Metrics:
         """
         Calculate performance metrics.
 
+        CORREÇÃO: unknown_rate agora é calculado baseado no INTERVALO, não acumulativo.
+
         Args:
             timestamp: Current time
-            unknown_count: Number of unknown predictions
+            total_unknown: TOTAL acumulado de unknowns (usado apenas para referência)
             divisor: Divisor for time normalization
 
         Returns:
             Metrics object
         """
-        true_positive = 0.0
-        false_positive = 0.0
-        false_negative = 0.0
-        total_samples = 0.0
+        # CORREÇÃO: Calcular unknowns DESTE INTERVALO
+        current_unknown = self.count_unknown()
+        interval_unknown = current_unknown - self.prev_unknown_count
+        self.prev_unknown_count = current_unknown
 
-        for true_label, predictions in self.matrix.items():
-            for pred_label, count in predictions.items():
-                total_samples += count
+        # Calcular métricas por classe
+        class_tp = {}
+        class_fp = {}
+        class_fn = {}
 
-                if true_label == pred_label:
-                    true_positive += count
-                else:
-                    false_positive += count
-                    false_negative += count
+        all_labels = list(self.matrix.keys())
 
-        true_negative = total_samples - true_positive - false_positive - false_negative
+        for true_label in all_labels:
+            if true_label == -1.0:  # Skip unknown
+                continue
 
-        # Calculate metrics
+            # True Positives: diagonal
+            tp = self.matrix[true_label].get(true_label, 0)
+
+            # False Positives: predicted as this class but isn't
+            fp = 0
+            for other_label in all_labels:
+                if other_label != true_label and other_label != -1.0:
+                    fp += self.matrix[other_label].get(true_label, 0)
+
+            # False Negatives: is this class but predicted as other
+            fn = 0
+            for pred_label in all_labels:
+                if pred_label != true_label and pred_label != -1.0:
+                    fn += self.matrix[true_label].get(pred_label, 0)
+
+            class_tp[true_label] = tp
+            class_fp[true_label] = fp
+            class_fn[true_label] = fn
+
+        # Micro-averaged metrics
+        total_tp = sum(class_tp.values())
+        total_fp = sum(class_fp.values())
+        total_fn = sum(class_fn.values())
+
+        # Total samples (excluindo unknowns para accuracy)
+        total_samples = sum(
+            sum(counts.values())
+            for label, counts in self.matrix.items()
+            if label != -1.0
+        )
+
+        # Accuracy: (TP + TN) / Total
+        # TN = total - (TP + FP + FN)
+        true_negative = total_samples - total_tp - total_fp - total_fn
         accuracy = (
-            (true_positive + true_negative) / total_samples
-            if total_samples > 0
-            else 0.0
+            (total_tp + true_negative) / total_samples if total_samples > 0 else 0.0
         )
 
+        # Precision: TP / (TP + FP)
         precision = (
-            true_positive / (true_positive + false_positive)
-            if (true_positive + false_positive) > 0
-            else 0.0
+            total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
         )
 
-        recall = (
-            true_positive / (true_positive + false_negative)
-            if (true_positive + false_negative) > 0
-            else 0.0
-        )
+        # Recall: TP / (TP + FN)
+        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
 
+        # F1-Score
         f1_score = (
             2 * precision * recall / (precision + recall)
             if (precision + recall) > 0
             else 0.0
         )
 
-        unknown_rate = unknown_count / divisor if divisor > 0 else 0.0
+        # Unknown Rate: unknowns DESTE INTERVALO / tamanho do intervalo
+        unknown_rate = interval_unknown / divisor if divisor > 0 else 0.0
 
         return Metrics(
             accuracy=accuracy,
@@ -206,12 +240,12 @@ class ConfusionMatrix:
             recall=recall,
             f1_score=f1_score,
             timestamp=timestamp,
-            unknown_count=unknown_count,
+            unknown_count=interval_unknown,  # CORREÇÃO: unknowns do intervalo
             unknown_rate=unknown_rate,
         )
 
     def count_unknown(self) -> int:
-        """Count total unknown (-1) predictions."""
+        """Count total unknown (-1) predictions ACUMULADOS."""
         count = 0
         for predictions in self.matrix.values():
             count += predictions.get(-1.0, 0)

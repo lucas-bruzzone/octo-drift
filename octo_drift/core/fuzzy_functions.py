@@ -18,6 +18,7 @@ class FuzzyCMeans:
         fuzzification: Fuzziness parameter (m)
         max_iter: Maximum iterations
         tol: Convergence tolerance
+        random_state: Seed for reproducibility
         centroids: Cluster centers
         membership_matrix: Fuzzy membership matrix
         labels: Hard cluster assignments
@@ -27,49 +28,102 @@ class FuzzyCMeans:
         self,
         n_clusters: int,
         fuzzification: float = 2.0,
-        max_iter: int = 100,
+        max_iter: int = 150,
         tol: float = 1e-4,
+        random_state: int = 42,
     ):
         self.n_clusters = n_clusters
         self.fuzzification = fuzzification
         self.max_iter = max_iter
         self.tol = tol
+        self.random_state = random_state
 
         self.centroids: npt.NDArray[np.float64] = np.array([])
         self.membership_matrix: npt.NDArray[np.float64] = np.array([])
         self.labels: npt.NDArray[np.int32] = np.array([])
 
     def fit(self, examples: List[Example]) -> "FuzzyCMeans":
+        """Fit FCM to examples with improved stability."""
         X = np.array([ex.point for ex in examples])
         n_samples, n_features = X.shape
 
-        # Inicialização vetorizada
-        U = np.random.rand(n_samples, self.n_clusters)
-        U = U / U.sum(axis=1, keepdims=True)
+        # Validação
+        if n_samples < self.n_clusters:
+            raise ValueError(
+                f"n_samples ({n_samples}) < n_clusters ({self.n_clusters})"
+            )
+
+        # Inicialização determinística usando k-means++
+        np.random.seed(self.random_state)
+        self.centroids = self._init_centroids_kmeanspp(X)
+
+        # Inicializar membership baseado em distâncias aos centroids iniciais
+        distances = np.linalg.norm(X[:, np.newaxis] - self.centroids, axis=2)
+        distances = np.maximum(distances, 1e-10)
+
+        exponent = 2.0 / (self.fuzzification - 1.0)
+        U = 1.0 / np.sum(
+            (distances[:, :, np.newaxis] / distances[:, np.newaxis, :]) ** exponent,
+            axis=2,
+        )
 
         for iteration in range(self.max_iter):
             U_old = U.copy()
 
             # Update centroids (vetorizado)
             Um = U**self.fuzzification
-            self.centroids = (Um.T @ X) / Um.sum(axis=0, keepdims=True).T
+            centroid_numerator = Um.T @ X
+            centroid_denominator = Um.sum(axis=0, keepdims=True).T
+            centroid_denominator = np.maximum(centroid_denominator, 1e-10)
+            self.centroids = centroid_numerator / centroid_denominator
 
-            # Update membership (VETORIZADO - crítico)
+            # Update membership (vetorizado com estabilidade)
             distances = np.linalg.norm(X[:, np.newaxis] - self.centroids, axis=2)
             distances = np.maximum(distances, 1e-10)
 
+            # Evitar divisão por zero
             exponent = 2.0 / (self.fuzzification - 1.0)
-            U = 1.0 / np.sum(
-                (distances[:, :, np.newaxis] / distances[:, np.newaxis, :]) ** exponent,
-                axis=2,
-            )
+            distance_ratio = distances[:, :, np.newaxis] / distances[:, np.newaxis, :]
+            distance_ratio = np.maximum(distance_ratio, 1e-10)
 
+            U = 1.0 / np.sum(distance_ratio**exponent, axis=2)
+
+            # Normalizar para garantir soma = 1
+            U = U / U.sum(axis=1, keepdims=True)
+
+            # Convergência
             if np.linalg.norm(U - U_old) < self.tol:
                 break
 
         self.membership_matrix = U
         self.labels = np.argmax(U, axis=1)
         return self
+
+    def _init_centroids_kmeanspp(
+        self, X: npt.NDArray[np.float64]
+    ) -> npt.NDArray[np.float64]:
+        """Initialize centroids using k-means++ strategy."""
+        n_samples = X.shape[0]
+        centroids = []
+
+        # Primeiro centroid aleatório
+        first_idx = np.random.randint(n_samples)
+        centroids.append(X[first_idx])
+
+        # Demais centroids baseados em distâncias
+        for _ in range(1, self.n_clusters):
+            distances = np.array(
+                [
+                    min(np.linalg.norm(X[i] - c) for c in centroids)
+                    for i in range(n_samples)
+                ]
+            )
+            distances = distances**2
+            probabilities = distances / distances.sum()
+            next_idx = np.random.choice(n_samples, p=probabilities)
+            centroids.append(X[next_idx])
+
+        return np.array(centroids)
 
     def get_cluster_members(
         self, cluster_idx: int, examples: List[Example]
@@ -216,20 +270,30 @@ def create_spfmics_from_clusters(
     min_weight: int,
     timestamp: int,
 ) -> List[SPFMiC]:
-    """Create SPFMiC micro-clusters from fuzzy clustering results."""
+    """
+    Create SPFMiC micro-clusters from fuzzy clustering results.
+
+    CORREÇÃO: Garante que índices estão alinhados entre examples e clusterer.labels
+    """
     spfmics = []
     membership = clusterer.membership_matrix
     typicality = calculate_typicality_matrix(membership)
 
-    for cluster_idx in range(clusterer.n_clusters):
-        cluster_examples = clusterer.get_cluster_members(cluster_idx, examples)
+    # CRÍTICO: Criar mapeamento explícito example -> índice no clustering
+    # Isso garante que labels[i] corresponde a examples[i]
 
-        if len(cluster_examples) < min_weight:
+    for cluster_idx in range(clusterer.n_clusters):
+        # Coletar índices dos exemplos neste cluster
+        cluster_member_indices = [
+            i for i in range(len(examples)) if clusterer.labels[i] == cluster_idx
+        ]
+
+        if len(cluster_member_indices) < min_weight:
             continue
 
         spfmic = SPFMiC(
             centroid=clusterer.centroids[cluster_idx].copy(),
-            n=len(cluster_examples),
+            n=len(cluster_member_indices),
             alpha=alpha,
             theta=theta,
             label=label,
@@ -237,27 +301,25 @@ def create_spfmics_from_clusters(
             updated=timestamp,
         )
 
-        # Aggregate statistics
+        # Aggregate statistics usando índices corretos
         cf1_pert = np.zeros_like(spfmic.centroid)
         cf1_typ = np.zeros_like(spfmic.centroid)
         me = 0.0
         te = 0.0
         ssde = 0.0
 
-        # FIX: Iterar por índices diretamente
-        for example_idx in range(len(examples)):
-            if clusterer.labels[example_idx] == cluster_idx:
-                example = examples[example_idx]
-                pert_val = membership[example_idx, cluster_idx]
-                typ_val = typicality[example_idx, cluster_idx]
+        for idx in cluster_member_indices:
+            example = examples[idx]
+            pert_val = membership[idx, cluster_idx]
+            typ_val = typicality[idx, cluster_idx]
 
-                distance = euclidean_distance(example, spfmic.centroid)
+            distance = euclidean_distance(example, spfmic.centroid)
 
-                cf1_pert += example.point * pert_val
-                cf1_typ += example.point * typ_val
-                me += pert_val**alpha
-                te += typ_val**theta
-                ssde += pert_val * (distance**2)
+            cf1_pert += example.point * pert_val
+            cf1_typ += example.point * typ_val
+            me += pert_val**alpha
+            te += typ_val**theta
+            ssde += pert_val * (distance**2)
 
         spfmic.cf1_pertinence = cf1_pert
         spfmic.cf1_typicality = cf1_typ

@@ -93,14 +93,27 @@ class OnlinePhase:
 
         total_examples = len(stream)
         start_time = time.time()
+
+        # Contadores para análise de performance
         classify_time = 0
         novelty_time = 0
         train_time = 0
+        cleanup_time = 0
+
+        # Contadores de classificação
+        classified_by_mcc = 0
+        classified_by_mcd = 0
+        unknown_count = 0
+        novelty_detection_calls = 0
 
         logger.info(f"Processing {total_examples} examples...")
+        logger.info(
+            f"Config: latency={self.latency}, chunk_size={self.chunk_size}, "
+            f"buffer_threshold={self.buffer_threshold}, phi={self.novelty_detector.phi}"
+        )
 
         for timestamp, example in enumerate(stream):
-            # Log progress every 1000 examples
+            # Log progress
             if timestamp > 0 and timestamp % 1000 == 0:
                 elapsed = time.time() - start_time
                 rate = timestamp / elapsed
@@ -116,8 +129,13 @@ class OnlinePhase:
                     f"Buffer: {len(unknown_buffer)}"
                 )
                 logger.debug(
+                    f"Classification: MCC={classified_by_mcc}, MCD={classified_by_mcd}, "
+                    f"Unknown={unknown_count}, ND_calls={novelty_detection_calls}"
+                )
+                logger.debug(
                     f"Time breakdown - Classify: {classify_time:.2f}s, "
-                    f"Novelty: {novelty_time:.2f}s, Train: {train_time:.2f}s"
+                    f"Novelty: {novelty_time:.2f}s, Train: {train_time:.2f}s, "
+                    f"Cleanup: {cleanup_time:.2f}s"
                 )
 
             # Classify with MCC
@@ -125,22 +143,38 @@ class OnlinePhase:
             predicted_label = self.supervised_model.classify(example, timestamp)
             example.predicted_label = predicted_label
 
-            # If unknown, try MCD
-            if predicted_label == -1:
+            if predicted_label != -1:
+                classified_by_mcc += 1
+            else:
+                # Try MCD
                 predicted_label = self.unsupervised_model.classify(
                     example, self.supervised_model.k, timestamp
                 )
                 example.predicted_label = predicted_label
 
-                # Still unknown - add to buffer
-                if predicted_label == -1:
+                if predicted_label != -1:
+                    classified_by_mcd += 1
+                else:
+                    # Still unknown - add to buffer
+                    unknown_count += 1
                     unknown_buffer.append(example)
+
+                    logger.debug(
+                        f"[t={timestamp}] Unknown example added to buffer "
+                        f"(true_label={example.true_label}, buffer_size={len(unknown_buffer)})"
+                    )
 
                     # Trigger novelty detection
                     if len(unknown_buffer) >= self.buffer_threshold:
                         t1 = time.time()
-                        logger.debug(f"Triggering novelty detection at t={timestamp}")
+                        novelty_detection_calls += 1
 
+                        logger.info(
+                            f"[t={timestamp}] Triggering novelty detection "
+                            f"(buffer_size={len(unknown_buffer)})"
+                        )
+
+                        prev_buffer_size = len(unknown_buffer)
                         unknown_buffer, novelty_detected = self.novelty_detector.detect(
                             unknown_buffer,
                             self.supervised_model,
@@ -148,16 +182,28 @@ class OnlinePhase:
                             timestamp,
                         )
 
+                        processed_count = prev_buffer_size - len(unknown_buffer)
+
                         novelty_time += time.time() - t1
 
                         if novelty_detected:
-                            logger.info(f"Novelty detected at t={timestamp}")
-                            # Update confusion matrix with discovered patterns
-                            for ex in unknown_buffer:
-                                if ex.predicted_label != -1:
+                            logger.info(
+                                f"[t={timestamp}] Novelty detected! "
+                                f"Processed {processed_count} examples, "
+                                f"remaining buffer: {len(unknown_buffer)}"
+                            )
+
+                            # Atualizar matriz de confusão com exemplos descobertos
+                            for ex in stream[: timestamp + 1]:
+                                if ex.predicted_label >= 100:  # É uma novidade
                                     self.confusion_matrix.update_confusion_matrix(
                                         ex.true_label
                                     )
+                        else:
+                            logger.debug(
+                                f"[t={timestamp}] No novelty detected. "
+                                f"Buffer size: {len(unknown_buffer)}"
+                            )
 
             classify_time += time.time() - t0
 
@@ -182,36 +228,69 @@ class OnlinePhase:
                     # Incremental training
                     if len(labeled_buffer) >= self.chunk_size:
                         t2 = time.time()
-                        logger.debug(f"Incremental training at t={timestamp}")
 
+                        logger.debug(
+                            f"[t={timestamp}] Incremental training "
+                            f"(labeled_buffer_size={len(labeled_buffer)})"
+                        )
+
+                        prev_mcc_size = len(self.supervised_model.get_spfmics())
                         labeled_buffer = self.supervised_model.train_new_classifier(
                             labeled_buffer, timestamp
                         )
-                        labeled_buffer.clear()
+                        new_mcc_size = len(self.supervised_model.get_spfmics())
 
+                        logger.debug(
+                            f"[t={timestamp}] MCC updated: {prev_mcc_size} -> {new_mcc_size} "
+                            f"SPFMiCs, remaining_buffer={len(labeled_buffer)}"
+                        )
+
+                        labeled_buffer.clear()
                         train_time += time.time() - t2
 
                     delayed_idx += 1
 
             # Cleanup old clusters
-            self.supervised_model.remove_old_spfmics(
-                self.latency + self.time_threshold, timestamp
-            )
-            self.unsupervised_model.remove_old_spfmics(
-                self.latency + self.time_threshold, timestamp
-            )
+            t3 = time.time()
+            threshold = self.latency + self.time_threshold
+
+            prev_mcc = len(self.supervised_model.get_spfmics())
+            prev_mcd = len(self.unsupervised_model.get_spfmics())
+            prev_buffer = len(unknown_buffer)
+
+            self.supervised_model.remove_old_spfmics(threshold, timestamp)
+            self.unsupervised_model.remove_old_spfmics(threshold, timestamp)
             self._remove_old_unknown(unknown_buffer, self.time_threshold, timestamp)
+
+            # Log apenas se houve mudanças significativas
+            new_mcc = len(self.supervised_model.get_spfmics())
+            new_mcd = len(self.unsupervised_model.get_spfmics())
+            new_buffer = len(unknown_buffer)
+
+            if (
+                (prev_mcc - new_mcc) > 5
+                or (prev_mcd - new_mcd) > 2
+                or (prev_buffer - new_buffer) > 10
+            ):
+                logger.debug(
+                    f"[t={timestamp}] Cleanup: MCC {prev_mcc}->{new_mcc}, "
+                    f"MCD {prev_mcd}->{new_mcd}, Buffer {prev_buffer}->{new_buffer}"
+                )
+
+            cleanup_time += time.time() - t3
 
             # Periodic evaluation
             if timestamp > 0 and timestamp % evaluation_interval == 0:
                 # Merge discovered novelties to true classes
                 merge_map = self.confusion_matrix.get_classes_with_nonzero_count()
-                self.confusion_matrix.merge_classes(merge_map)
+                if merge_map:
+                    logger.debug(f"[t={timestamp}] Merging classes: {merge_map}")
+                    self.confusion_matrix.merge_classes(merge_map)
 
                 # Calculate metrics
-                unknown_count = self.confusion_matrix.count_unknown()
+                unknown_count_cm = self.confusion_matrix.count_unknown()
                 metrics = self.confusion_matrix.calculate_metrics(
-                    timestamp, unknown_count, evaluation_interval
+                    timestamp, unknown_count_cm, evaluation_interval
                 )
                 metrics_list.append(metrics)
 
@@ -219,10 +298,12 @@ class OnlinePhase:
                     f"Metrics at t={timestamp}: "
                     f"Acc={metrics.accuracy:.4f}, "
                     f"Prec={metrics.precision:.4f}, "
+                    f"Rec={metrics.recall:.4f}, "
+                    f"F1={metrics.f1_score:.4f}, "
                     f"UnkRate={metrics.unknown_rate:.4f}"
                 )
 
-                # Track novelties
+                # Track novelties in this interval
                 novelty_in_interval = any(
                     ex.predicted_label >= 100
                     for ex in stream[
@@ -231,14 +312,32 @@ class OnlinePhase:
                 )
                 novelty_flags.append(1.0 if novelty_in_interval else 0.0)
 
+                # Reset counters
+                classified_by_mcc = 0
+                classified_by_mcd = 0
+                unknown_count = 0
+                novelty_detection_calls = 0
+
         total_time = time.time() - start_time
         logger.info(f"Processing complete in {total_time/60:.2f} minutes")
         logger.info(f"Average rate: {total_examples/total_time:.1f} examples/second")
+        logger.info(
+            f"Final state: MCC={len(self.supervised_model.get_spfmics())}, "
+            f"MCD={len(self.unsupervised_model.get_spfmics())}, "
+            f"Buffer={len(unknown_buffer)}"
+        )
 
         return metrics_list, novelty_flags, stream
 
     def _remove_old_unknown(
         self, buffer: List[Example], threshold: int, current_time: int
     ) -> None:
-        """Remove old examples from unknown buffer."""
-        buffer[:] = [ex for ex in buffer if current_time - ex.timestamp < threshold]
+        """Remove old examples from unknown buffer (in-place)."""
+        # CORREÇÃO: Modificar lista in-place para preservar referência
+        to_remove = []
+        for ex in buffer:
+            if current_time - ex.timestamp >= threshold:
+                to_remove.append(ex)
+
+        for ex in to_remove:
+            buffer.remove(ex)

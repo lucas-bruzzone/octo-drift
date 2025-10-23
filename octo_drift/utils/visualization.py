@@ -148,6 +148,7 @@ def plot_all_metrics(
 
     plt.show()
 
+
 def plot_parameter_sensitivity(
     results: dict,
     param_name: str,
