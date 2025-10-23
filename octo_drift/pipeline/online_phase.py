@@ -2,6 +2,8 @@
 Online phase for octo-drift - Stream processing and novelty detection.
 """
 
+import logging
+import time
 from typing import List, Tuple
 import numpy as np
 from ..core.structures import Example
@@ -9,6 +11,8 @@ from ..models.supervised import SupervisedModel
 from ..models.unsupervised import UnsupervisedModel
 from ..detection.novelty_detector import NoveltyDetector
 from ..evaluation.confusion_matrix import ConfusionMatrix, Metrics
+
+logger = logging.getLogger(__name__)
 
 
 class OnlinePhase:
@@ -66,7 +70,7 @@ class OnlinePhase:
 
     def process_stream(
         self, stream: List[Example], evaluation_interval: int = 1000
-    ) -> Tuple[List[Metrics], List[float]]:
+    ) -> Tuple[List[Metrics], List[float], List[Example]]:
         """
         Process data stream with latency and novelty detection.
 
@@ -75,7 +79,7 @@ class OnlinePhase:
             evaluation_interval: Compute metrics every N examples
 
         Returns:
-            Tuple of (metrics_list, novelty_flags)
+            Tuple of (metrics_list, novelty_flags, processed_stream)
         """
         unknown_buffer = []
         labeled_buffer = []
@@ -87,8 +91,37 @@ class OnlinePhase:
         latency_counter = 0
         delayed_idx = 0
 
+        total_examples = len(stream)
+        start_time = time.time()
+        classify_time = 0
+        novelty_time = 0
+        train_time = 0
+
+        logger.info(f"Processing {total_examples} examples...")
+
         for timestamp, example in enumerate(stream):
+            # Log progress every 1000 examples
+            if timestamp > 0 and timestamp % 1000 == 0:
+                elapsed = time.time() - start_time
+                rate = timestamp / elapsed
+                eta = (total_examples - timestamp) / rate if rate > 0 else 0
+
+                logger.info(
+                    f"Progress: {timestamp}/{total_examples} "
+                    f"({100*timestamp/total_examples:.1f}%) | "
+                    f"Rate: {rate:.1f} ex/s | "
+                    f"ETA: {eta/60:.1f}min | "
+                    f"MCC: {len(self.supervised_model.get_spfmics())} | "
+                    f"MCD: {len(self.unsupervised_model.get_spfmics())} | "
+                    f"Buffer: {len(unknown_buffer)}"
+                )
+                logger.debug(
+                    f"Time breakdown - Classify: {classify_time:.2f}s, "
+                    f"Novelty: {novelty_time:.2f}s, Train: {train_time:.2f}s"
+                )
+
             # Classify with MCC
+            t0 = time.time()
             predicted_label = self.supervised_model.classify(example, timestamp)
             example.predicted_label = predicted_label
 
@@ -105,6 +138,9 @@ class OnlinePhase:
 
                     # Trigger novelty detection
                     if len(unknown_buffer) >= self.buffer_threshold:
+                        t1 = time.time()
+                        logger.debug(f"Triggering novelty detection at t={timestamp}")
+
                         unknown_buffer, novelty_detected = self.novelty_detector.detect(
                             unknown_buffer,
                             self.supervised_model,
@@ -112,13 +148,18 @@ class OnlinePhase:
                             timestamp,
                         )
 
+                        novelty_time += time.time() - t1
+
                         if novelty_detected:
+                            logger.info(f"Novelty detected at t={timestamp}")
                             # Update confusion matrix with discovered patterns
                             for ex in unknown_buffer:
                                 if ex.predicted_label != -1:
                                     self.confusion_matrix.update_confusion_matrix(
                                         ex.true_label
                                     )
+
+            classify_time += time.time() - t0
 
             # Update confusion matrix
             self.confusion_matrix.add_instance(
@@ -140,10 +181,15 @@ class OnlinePhase:
 
                     # Incremental training
                     if len(labeled_buffer) >= self.chunk_size:
+                        t2 = time.time()
+                        logger.debug(f"Incremental training at t={timestamp}")
+
                         labeled_buffer = self.supervised_model.train_new_classifier(
                             labeled_buffer, timestamp
                         )
                         labeled_buffer.clear()
+
+                        train_time += time.time() - t2
 
                     delayed_idx += 1
 
@@ -169,8 +215,14 @@ class OnlinePhase:
                 )
                 metrics_list.append(metrics)
 
+                logger.info(
+                    f"Metrics at t={timestamp}: "
+                    f"Acc={metrics.accuracy:.4f}, "
+                    f"Prec={metrics.precision:.4f}, "
+                    f"UnkRate={metrics.unknown_rate:.4f}"
+                )
+
                 # Track novelties
-                # Check if any novelty was detected in this interval
                 novelty_in_interval = any(
                     ex.predicted_label >= 100
                     for ex in stream[
@@ -179,7 +231,11 @@ class OnlinePhase:
                 )
                 novelty_flags.append(1.0 if novelty_in_interval else 0.0)
 
-        return metrics_list, novelty_flags
+        total_time = time.time() - start_time
+        logger.info(f"Processing complete in {total_time/60:.2f} minutes")
+        logger.info(f"Average rate: {total_examples/total_time:.1f} examples/second")
+
+        return metrics_list, novelty_flags, stream
 
     def _remove_old_unknown(
         self, buffer: List[Example], threshold: int, current_time: int

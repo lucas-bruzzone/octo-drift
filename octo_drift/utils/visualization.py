@@ -2,27 +2,30 @@
 Visualization utilities for octo-drift.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Set
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from ..evaluation.confusion_matrix import Metrics
+from ..core.structures import Example
 
 
 def plot_metrics(
     metrics_list: List[Metrics],
+    stream: List[Example],  # NOVO: para identificar quando classes aparecem
     novelty_flags: Optional[List[float]] = None,
-    novelty_timestamps: Optional[List[int]] = None,
     save_path: Optional[str] = None,
+    evaluation_interval: int = 1000,
 ) -> None:
     """
-    Plot accuracy and unknown rate over time.
+    Plot accuracy and unknown rate with novelty markers.
 
     Args:
         metrics_list: List of Metrics objects
+        stream: Full data stream to identify class appearances
         novelty_flags: Binary flags for novelty detection
-        novelty_timestamps: Timestamps when new classes appeared
         save_path: Path to save figure
+        evaluation_interval: Interval between evaluations
     """
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
@@ -37,35 +40,46 @@ def plot_metrics(
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=10)
 
-    # Mark novelties
-    if novelty_flags:
-        for i, flag in enumerate(novelty_flags):
-            if flag > 0:
-                ax1.axvline(x=timestamps[i], color="gray", linestyle="--", alpha=0.5)
-
-    # Mark new class appearances
-    if novelty_timestamps:
-        for ts in novelty_timestamps:
-            ax1.axvline(x=ts, color="black", linestyle="-", linewidth=1.5, alpha=0.7)
-
     # Plot unknown rate
     ax2.plot(timestamps, unknown_rates, "orange", linewidth=2, label="Unknown Rate")
     ax2.set_xlabel("Evaluation Moments", fontsize=12)
     ax2.set_ylabel("Unknown Rate (%)", fontsize=12)
-    ax2.set_ylim([0, 50])
+    ax2.set_ylim([0, max(10, max(unknown_rates) * 1.1)])  # Escala dinâmica
     ax2.grid(True, alpha=0.3)
     ax2.legend(fontsize=10)
 
-    # Mark novelties
+    # Identificar quando novas classes APARECEM no stream
+    class_appearance_timestamps = find_class_appearances(stream, evaluation_interval)
+
+    for ts in class_appearance_timestamps:
+        ax1.axvline(
+            x=ts,
+            color="black",
+            linestyle="-",
+            linewidth=1.5,
+            alpha=0.7,
+            label="New Class Appears" if ts == class_appearance_timestamps[0] else "",
+        )
+        ax2.axvline(x=ts, color="black", linestyle="-", linewidth=1.5, alpha=0.7)
+
+    # Marcar quando novidades são DETECTADAS
     if novelty_flags:
         for i, flag in enumerate(novelty_flags):
             if flag > 0:
-                ax2.axvline(x=timestamps[i], color="gray", linestyle="--", alpha=0.5)
+                ts = timestamps[i]
+                ax1.axvline(
+                    x=ts,
+                    color="gray",
+                    linestyle="--",
+                    alpha=0.5,
+                    label="Novelty Detected" if i == 0 else "",
+                )
+                ax2.axvline(x=ts, color="gray", linestyle="--", alpha=0.5)
 
-    # Mark new class appearances
-    if novelty_timestamps:
-        for ts in novelty_timestamps:
-            ax2.axvline(x=ts, color="black", linestyle="-", linewidth=1.5, alpha=0.7)
+    # Adicionar legendas apenas uma vez
+    handles1, labels1 = ax1.get_legend_handles_labels()
+    by_label1 = dict(zip(labels1, handles1))
+    ax1.legend(by_label1.values(), by_label1.keys(), fontsize=10)
 
     plt.tight_layout()
 
@@ -76,16 +90,37 @@ def plot_metrics(
     plt.show()
 
 
+def find_class_appearances(
+    stream: List[Example], evaluation_interval: int
+) -> List[int]:
+    """
+    Identifica os momentos de avaliação onde novas classes aparecem pela primeira vez.
+
+    Args:
+        stream: Lista de exemplos do stream
+        evaluation_interval: Intervalo entre avaliações
+
+    Returns:
+        Lista de timestamps onde novas classes aparecem
+    """
+    seen_classes: Set[float] = set()
+    appearance_timestamps = []
+
+    for i, example in enumerate(stream):
+        if example.true_label not in seen_classes:
+            seen_classes.add(example.true_label)
+            # Mapear para o próximo momento de avaliação
+            eval_moment = ((i // evaluation_interval) + 1) * evaluation_interval
+            if eval_moment not in appearance_timestamps:
+                appearance_timestamps.append(eval_moment)
+
+    return sorted(appearance_timestamps)
+
+
 def plot_all_metrics(
     metrics_list: List[Metrics], save_path: Optional[str] = None
 ) -> None:
-    """
-    Plot all metrics (accuracy, precision, recall, F1) in one figure.
-
-    Args:
-        metrics_list: List of Metrics objects
-        save_path: Path to save figure
-    """
+    """Plot all metrics (accuracy, precision, recall, F1) in one figure."""
     fig, ax = plt.subplots(figsize=(12, 6))
 
     timestamps = [m.timestamp for m in metrics_list]
@@ -112,7 +147,6 @@ def plot_all_metrics(
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
 
     plt.show()
-
 
 def plot_parameter_sensitivity(
     results: dict,

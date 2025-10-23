@@ -40,45 +40,35 @@ class FuzzyCMeans:
         self.labels: npt.NDArray[np.int32] = np.array([])
 
     def fit(self, examples: List[Example]) -> "FuzzyCMeans":
-        """
-        Fit fuzzy c-means on data.
-
-        Args:
-            examples: List of Example objects
-
-        Returns:
-            self
-        """
         X = np.array([ex.point for ex in examples])
-        n_samples = X.shape[0]
+        n_samples, n_features = X.shape
 
-        # Initialize membership matrix randomly
+        # Inicialização vetorizada
         U = np.random.rand(n_samples, self.n_clusters)
         U = U / U.sum(axis=1, keepdims=True)
 
         for iteration in range(self.max_iter):
             U_old = U.copy()
 
-            # Update centroids
+            # Update centroids (vetorizado)
             Um = U**self.fuzzification
             self.centroids = (Um.T @ X) / Um.sum(axis=0, keepdims=True).T
 
-            # Update membership matrix
-            for i in range(n_samples):
-                for j in range(self.n_clusters):
-                    distances = batch_euclidean_distance(self.centroids, X[i])
-                    distances = np.maximum(distances, 1e-10)
+            # Update membership (VETORIZADO - crítico)
+            distances = np.linalg.norm(X[:, np.newaxis] - self.centroids, axis=2)
+            distances = np.maximum(distances, 1e-10)
 
-                    exponent = 2.0 / (self.fuzzification - 1.0)
-                    U[i, j] = 1.0 / np.sum((distances[j] / distances) ** exponent)
+            exponent = 2.0 / (self.fuzzification - 1.0)
+            U = 1.0 / np.sum(
+                (distances[:, :, np.newaxis] / distances[:, np.newaxis, :]) ** exponent,
+                axis=2,
+            )
 
-            # Check convergence
             if np.linalg.norm(U - U_old) < self.tol:
                 break
 
         self.membership_matrix = U
         self.labels = np.argmax(U, axis=1)
-
         return self
 
     def get_cluster_members(

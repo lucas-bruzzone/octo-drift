@@ -165,19 +165,25 @@ class NoveltyDetector:
 
         return unknown_buffer, novelty_detected
 
-    def _process_as_extension(self, candidate: SPFMiC, members: List[Example],
-                            buffer: List[Example], mcd: UnsupervisedModel,
-                            label: float, timestamp: int) -> None:
+    def _process_as_extension(
+        self,
+        candidate: SPFMiC,
+        members: List[Example],
+        buffer: List[Example],
+        mcd: UnsupervisedModel,
+        label: float,
+        timestamp: int,
+    ) -> None:
         """Process cluster as extension of known class."""
         candidate.label = label
-        
+
         true_labels = [ex.true_label for ex in members]
         most_common_label = Counter(true_labels).most_common(1)[0][0]
-        
+
         if most_common_label == label:
             candidate.true_label = most_common_label
             mcd.add_spfmic(candidate)
-        
+
         # FIX: Remover por identidade, não por igualdade
         for member in members:
             member.predicted_label = candidate.label
@@ -186,19 +192,24 @@ class NoveltyDetector:
             except ValueError:
                 pass
 
-    def _process_as_novelty(self, candidate: SPFMiC, members: List[Example],
-                        buffer: List[Example], mcd: UnsupervisedModel,
-                        timestamp: int) -> None:
+    def _process_as_novelty(
+        self,
+        candidate: SPFMiC,
+        members: List[Example],
+        buffer: List[Example],
+        mcd: UnsupervisedModel,
+        timestamp: int,
+    ) -> None:
         """Process cluster as true novelty."""
         candidate.label = self.novelty_counter
         self.novelty_counter += 1
-        
+
         true_labels = [ex.true_label for ex in members]
         most_common_label = Counter(true_labels).most_common(1)[0][0]
         candidate.true_label = most_common_label
-        
+
         mcd.add_spfmic(candidate)
-        
+
         # FIX: Remover por identidade, não por igualdade
         for member in members:
             member.predicted_label = candidate.label

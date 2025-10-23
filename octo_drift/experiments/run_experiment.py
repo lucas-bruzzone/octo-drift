@@ -71,7 +71,7 @@ def run_single_experiment(
         percent_labeled=config.percent_labeled,
     )
 
-    metrics_list, novelty_flags = online.process_stream(
+    metrics_list, novelty_flags, processed_stream = online.process_stream(
         test_examples, evaluation_interval=config.evaluation_interval
     )
 
@@ -80,12 +80,18 @@ def run_single_experiment(
 
     # Save results
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_results(test_examples, output_dir / "results.csv")
+    save_results(processed_stream, output_dir / "results.csv")
     save_metrics(metrics_list, output_dir / "metrics.csv")
     save_novelties(novelty_flags, output_dir / "novelties.csv")
 
-    # Generate plots
-    plot_metrics(metrics_list, novelty_flags, save_path=output_dir / "metrics_plot.png")
+    # Generate plots with stream for class appearance markers
+    plot_metrics(
+        metrics_list,
+        processed_stream,
+        novelty_flags,
+        save_path=output_dir / "metrics_plot.png",
+        evaluation_interval=config.evaluation_interval,
+    )
     plot_all_metrics(metrics_list, save_path=output_dir / "all_metrics.png")
 
     return metrics_list[-1]
